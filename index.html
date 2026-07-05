@@ -613,14 +613,14 @@ function freshWeek(){ return {order:[1,2,3,4,5,6,7], done:[]}; }
 function defaultState(){
   return {xp:0, streak:0, lastTrained:null, weeksDone:0, week:freshWeek(), session:null,
           weights:{}, profileId:uuid(), updatedAt:null,
-          settings:{rest:true, restSecs:60, vibrate:true, unit:'kg', sbUrl:'', sbKey:''}};
+          settings:{rest:true, restSecs:60, vibrate:true, unit:'kg', ghToken:'', gistId:''}};
 }
 let S = load();
 function load(){
   try{
     const s=JSON.parse(localStorage.getItem(KEY));
     if(!s||!s.week) return defaultState();
-    s.settings=Object.assign({rest:true,restSecs:60,vibrate:true,unit:'kg',sbUrl:'',sbKey:''}, s.settings||{});
+    s.settings=Object.assign({rest:true,restSecs:60,vibrate:true,unit:'kg',ghToken:'',gistId:''}, s.settings||{});
     s.weights=s.weights||{};
     if(!s.profileId) s.profileId=uuid();
     // sesión de una versión anterior incompatible (estructura de circuito distinta) -> descartar
@@ -629,68 +629,81 @@ function load(){
   }
   catch(e){ return defaultState(); }
 }
-function save(){ S.updatedAt=new Date().toISOString(); localStorage.setItem(KEY, JSON.stringify(S)); schedulePush(); }
+function save(){ S.updatedAt=new Date().toISOString(); localStorage.setItem(KEY, JSON.stringify(S)); markDirty(); }
 
 /* =================================================================
-   BASE DE DATOS LOCAL (registro completo) + SINCRONIZACIÓN SUPABASE
-   Tablas: sessions (cada entrenamiento), sets (cada serie con peso),
-   events (omisiones, swaps, récords, niveles), app_state (multi-dispositivo)
+   BASE DE DATOS LOCAL (registro completo) + SINCRONIZACIÓN VÍA GITHUB GIST
+   Un Gist privado con dos archivos:
+     gymquest-data.json  -> todo (estado + sesiones + series + eventos), fuente de verdad para sincronizar
+     gymquest-series.csv -> tus series, para abrir directo en Excel/Sheets
+   Sin backend ni SQL: solo un Personal Access Token de GitHub (permiso "gist").
    ================================================================= */
 let SL=loadLog();
 function loadLog(){
   try{ const l=JSON.parse(localStorage.getItem(LOGKEY));
-    if(l&&Array.isArray(l.sets)) return Object.assign({sessions:[],sets:[],events:[],queue:[]},l); }
+    if(l&&Array.isArray(l.sets)) return Object.assign({sessions:[],sets:[],events:[]},l); }
   catch(e){}
-  return {sessions:[],sets:[],events:[],queue:[]};
+  return {sessions:[],sets:[],events:[]};
 }
 function saveLog(){ localStorage.setItem(LOGKEY, JSON.stringify(SL)); }
 
-function sbReady(){ return !!(S.settings.sbUrl && S.settings.sbKey); }
-function sbFetch(path,opts={}){
-  const u=S.settings.sbUrl.replace(/\/+$/,'');
-  const h=Object.assign({apikey:S.settings.sbKey,Authorization:'Bearer '+S.settings.sbKey,
-    'Content-Type':'application/json',Prefer:'resolution=merge-duplicates'},opts.headers||{});
-  return fetch(u+'/rest/v1/'+path, Object.assign({},opts,{headers:h}));
+function ghReady(){ return !!S.settings.ghToken; }
+function ghHeaders(){
+  return {Authorization:'Bearer '+S.settings.ghToken, Accept:'application/vnd.github+json',
+    'Content-Type':'application/json'};
 }
-function queueSync(table,row){ SL.queue.push({t:table,r:row}); saveLog(); flushSync(); }
-let flushing=false;
-async function flushSync(){
-  if(!sbReady()||flushing||!SL.queue.length) return;
-  flushing=true;
-  try{
-    const groups={};
-    SL.queue.forEach(q=>{ (groups[q.t]=groups[q.t]||[]).push(q.r); });
-    for(const t of Object.keys(groups)){
-      const r=await sbFetch(t,{method:'POST',body:JSON.stringify(groups[t])});
-      if(r.ok) SL.queue=SL.queue.filter(q=>q.t!==t);
-    }
-    saveLog();
-  }catch(e){/* sin conexión: la cola persiste y se reintenta */}
-  finally{ flushing=false; }
+const CSV_COLS=['logged_at','week_number','day_id','day_title','block','kind','exercise','set_number','sets_total','target','weight','unit','weight_kg','is_pr','times_postponed','session_id'];
+function buildCSV(){
+  const esc=v=>v==null?'':(/[",\n]/.test(String(v))?'"'+String(v).replace(/"/g,'""')+'"':String(v));
+  return [CSV_COLS.join(',')].concat(SL.sets.map(r=>CSV_COLS.map(c=>esc(r[c])).join(','))).join('\n');
 }
-/* estado de progreso multi-dispositivo (last-write-wins) */
+/* estado de progreso a sincronizar (last-write-wins por updated_at) */
 function progressState(){ const {xp,streak,lastTrained,weeksDone,week,weights,updatedAt}=S;
   return {xp,streak,lastTrained,weeksDone,week,weights,updatedAt}; }
-let pushT=null;
-function schedulePush(){ if(!sbReady())return; clearTimeout(pushT); pushT=setTimeout(pushState,2500); }
-async function pushState(){
-  if(!sbReady())return;
-  try{ await sbFetch('app_state',{method:'POST',
-    body:JSON.stringify([{profile_id:S.profileId,state:progressState(),updated_at:S.updatedAt||new Date().toISOString()}])}); }
-  catch(e){}
+function buildGistPayload(){
+  return JSON.stringify({updated_at:S.updatedAt||new Date().toISOString(), profile_id:S.profileId,
+    state:progressState(), sessions:SL.sessions, sets:SL.sets, events:SL.events}, null, 2);
 }
-async function pullState(){
-  if(!sbReady())return;
+let pushT=null, pushing=false, pushAgain=false;
+function markDirty(){ if(!ghReady()) return; clearTimeout(pushT); pushT=setTimeout(pushGist,2500); }
+async function pushGist(){
+  if(!ghReady()) return;
+  if(pushing){ pushAgain=true; return; }
+  pushing=true;
+  const files={ 'gymquest-data.json':{content: buildGistPayload()},
+    'gymquest-series.csv':{content: buildCSV() || 'sin series todavía'} };
   try{
-    const r=await sbFetch('app_state?profile_id=eq.'+encodeURIComponent(S.profileId)+'&select=state,updated_at');
-    if(!r.ok) return;
-    const rows=await r.json();
-    if(rows[0]&&rows[0].state&&rows[0].updated_at&&(!S.updatedAt||rows[0].updated_at>S.updatedAt)){
-      Object.assign(S,rows[0].state); S.updatedAt=rows[0].updated_at;
-      localStorage.setItem(KEY,JSON.stringify(S));
-      toast('☁️ Progreso sincronizado desde la nube'); render();
+    if(S.settings.gistId){
+      const r=await fetch('https://api.github.com/gists/'+S.settings.gistId,
+        {method:'PATCH',headers:ghHeaders(),body:JSON.stringify({files})});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+    } else {
+      const r=await fetch('https://api.github.com/gists',
+        {method:'POST',headers:ghHeaders(),body:JSON.stringify({description:'Gym Quest — datos de entrenamiento (privado)',public:false,files})});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const j=await r.json();
+      S.settings.gistId=j.id; localStorage.setItem(KEY, JSON.stringify(S));
     }
-  }catch(e){}
+  }catch(e){ /* sin conexión o token inválido: se reintenta en el próximo cambio */ }
+  finally{ pushing=false; if(pushAgain){ pushAgain=false; markDirty(); } }
+}
+async function pullGist(){
+  if(!ghReady()||!S.settings.gistId) return {ok:false};
+  try{
+    const r=await fetch('https://api.github.com/gists/'+S.settings.gistId,{headers:ghHeaders()});
+    if(!r.ok) return {ok:false,status:r.status};
+    const j=await r.json();
+    const f=j.files && j.files['gymquest-data.json'];
+    if(!f) return {ok:false};
+    const remote=JSON.parse(f.content);
+    if(remote.updated_at && (!S.updatedAt || remote.updated_at>S.updatedAt)){
+      Object.assign(S, remote.state); S.updatedAt=remote.updated_at;
+      SL.sessions=remote.sessions||[]; SL.sets=remote.sets||[]; SL.events=remote.events||[];
+      saveLog(); localStorage.setItem(KEY, JSON.stringify(S));
+      toast('☁️ Datos sincronizados desde GitHub'); render();
+    }
+    return {ok:true};
+  }catch(e){ return {ok:false}; }
 }
 
 /* --- helpers de registro --- */
@@ -698,7 +711,7 @@ function startSession(d){
   const rec={id:uuid(),profile_id:S.profileId,day_id:d.id,day_title:d.title,day_type:d.type,
     week_number:S.weeksDone+1,started_at:new Date().toISOString(),finished_at:null,duration_min:null,
     completed:false,sets_planned:totalSetsOfDay(d),sets_done:0,postpones:0};
-  SL.sessions.push(rec); saveLog(); queueSync('sessions',rec); return rec.id;
+  SL.sessions.push(rec); saveLog(); markDirty(); return rec.id;
 }
 function finishSession(){
   const s=S.session; if(!s||!s.sid) return;
@@ -707,12 +720,12 @@ function finishSession(){
   rec.duration_min=round1((new Date(rec.finished_at)-new Date(rec.started_at))/60000);
   rec.completed=true; rec.sets_done=setsDoneTotal();
   rec.postpones=Object.values(s.postponed||{}).reduce((a,b)=>a+b,0);
-  saveLog(); queueSync('sessions',rec);
+  saveLog(); markDirty();
 }
 function logEvent(type,detail){
   const rec={id:uuid(),profile_id:S.profileId,ts:new Date().toISOString(),type,detail:detail||{},
     week_number:S.weeksDone+1,day_id:S.session?S.session.dayId:(currentDayId()||null)};
-  SL.events.push(rec); saveLog(); queueSync('events',rec);
+  SL.events.push(rec); saveLog(); markDirty();
 }
 function logSet(e,d,setNumber,weight,isPr,timesPostponed){
   const rec={id:uuid(),session_id:S.session?S.session.sid:null,profile_id:S.profileId,
@@ -721,7 +734,7 @@ function logSet(e,d,setNumber,weight,isPr,timesPostponed){
     target:repsPart(e.sets),weight:weight,unit:weight!=null?S.settings.unit:null,
     weight_kg:weight!=null?round1(toKg(weight,S.settings.unit)):null,
     times_postponed:timesPostponed||0,is_pr:!!isPr};
-  SL.sets.push(rec); saveLog(); queueSync('sets',rec);
+  SL.sets.push(rec); saveLog(); markDirty();
 }
 function maxWeightKg(exName){
   let m=null;
@@ -1104,7 +1117,8 @@ function statsHTML(){
   <div class="tipbox"><h4>😴 Recuperación</h4><p>7-9 h de sueño y 8.000-10.000 pasos diarios. La postura toma semanas/meses de trabajo constante — por eso el bloque correctivo va en cada sesión y hay rutina postural incluso en descanso.</p></div>`;
 }
 function settingsHTML(){
-  const st=S.settings, pend=SL.queue.length;
+  const st=S.settings;
+  const gistLink=st.gistId?`<a href="https://gist.github.com/${st.gistId}" target="_blank" rel="noopener" style="color:var(--cyan);font-weight:700;font-size:13px;text-decoration:none;display:inline-block;margin-top:8px">📄 Ver mis datos en GitHub →</a>`:'';
   return `<div class="setrow"><div><div class="st">Unidad de peso</div><div class="ss">Para registrar tus series</div></div>
     <div class="stepper">
       <button style="width:46px;font-size:13px;${st.unit==='kg'?'border-color:var(--violet);color:#fff;background:rgba(139,92,246,.2)':''}" onclick="setUnit('kg')">kg</button>
@@ -1117,21 +1131,17 @@ function settingsHTML(){
   <div class="setrow"><div><div class="st">Vibración</div><div class="ss">Feedback háptico al completar series (móvil)</div></div>
     <div class="switch ${st.vibrate?'on':''}" onclick="toggleSet('vibrate')"><i></i></div></div>
 
-  <div class="tipbox"><h4>☁️ Base de datos en la nube (Supabase)</h4>
-    <p>Conecta tu proyecto gratuito de Supabase para guardar todo en Postgres y verlo desde cualquier dispositivo. Instrucciones en el README.</p>
-    <input class="txtin" id="sburl" placeholder="URL · https://xxxx.supabase.co" value="${st.sbUrl||''}">
-    <input class="txtin" id="sbkey" placeholder="anon public key" value="${st.sbKey||''}">
-    <button class="ghostbtn" onclick="sbSave()">Guardar y probar conexión</button>
-    <p style="margin-top:10px">${sbReady()
-      ? ('🟢 Configurado · '+(pend? pend+' registro(s) pendiente(s) de subir' : 'todo sincronizado'))
+  <div class="tipbox"><h4>☁️ Guardar en GitHub (sin SQL)</h4>
+    <p>Tus datos se guardan en un <b style="color:var(--txt)">Gist privado</b> de tu cuenta de GitHub — un archivo JSON (sincroniza) y uno CSV (para abrir en Excel/Sheets). Solo necesitas un token personal con permiso "gist".</p>
+    <a href="https://github.com/settings/tokens/new?scopes=gist&description=GymQuest" target="_blank" rel="noopener" style="color:var(--cyan);font-weight:700;font-size:13px;text-decoration:none">🔑 Crear token en GitHub (marca solo "gist") →</a>
+    <input class="txtin" id="ghtoken" type="password" placeholder="Pega tu token (ghp_... o github_pat_...)" value="${st.ghToken||''}">
+    <input class="txtin" id="gistid" placeholder="Gist ID (vacío = se crea uno nuevo)" value="${st.gistId||''}">
+    <button class="ghostbtn" onclick="ghSave()">Guardar y sincronizar</button>
+    <p style="margin-top:10px">${ghReady()
+      ? ('🟢 Conectado'+(st.gistId?'':' · se creará el Gist al guardar la próxima serie'))
       : '⚪ Sin configurar — los datos se guardan solo en este dispositivo'}</p>
-  </div>
-
-  <div class="tipbox"><h4>👤 ID de perfil (multi-dispositivo)</h4>
-    <p style="word-break:break-all;font-family:ui-monospace,Consolas,monospace;font-size:11.5px">${S.profileId}</p>
-    <button class="ghostbtn" onclick="copyProfile()">📋 Copiar mi ID</button>
-    <input class="txtin" id="pidin" placeholder="Pegar ID de otro dispositivo">
-    <button class="ghostbtn" onclick="adoptProfile()">Usar ese ID en este dispositivo</button>
+    ${gistLink}
+    <p style="margin-top:10px;font-size:12px;color:var(--muted2)">Para usarlo en otro dispositivo: pega el mismo token (o crea uno nuevo) y el mismo Gist ID aquí.</p>
   </div>
 
   <div class="tipbox"><h4>📤 Exportar datos para análisis</h4>
@@ -1147,29 +1157,20 @@ function settingsHTML(){
   <div class="footnote" style="margin-top:20px">Gym Quest · plan de Recomposición y Postura</div>`;
 }
 function setUnit(u){ S.settings.unit=u; save(); renderTab(); }
-async function sbSave(){
-  const u=document.getElementById('sburl'), k=document.getElementById('sbkey');
-  S.settings.sbUrl=(u&&u.value||'').trim().replace(/\/+$/,'');
-  S.settings.sbKey=(k&&k.value||'').trim();
+async function ghSave(){
+  const t=document.getElementById('ghtoken'), g=document.getElementById('gistid');
+  S.settings.ghToken=(t&&t.value||'').trim();
+  S.settings.gistId=(g&&g.value||'').trim();
   save();
-  if(!sbReady()){ toast('Configuración de nube borrada'); renderTab(); return; }
-  toast('Probando conexión…');
-  try{
-    const r=await sbFetch('app_state?select=profile_id&limit=1');
-    if(r.ok){ toast('🟢 ¡Conexión exitosa!'); flushSync(); pushState(); pullState(); }
-    else toast('🔴 Error '+r.status+' — revisa URL, key y que corriste schema.sql');
-  }catch(e){ toast('🔴 No se pudo conectar'); }
+  if(!ghReady()){ toast('Configuración de GitHub borrada'); renderTab(); return; }
+  toast('Conectando con GitHub…');
+  if(S.settings.gistId){
+    const res=await pullGist();
+    if(!res.ok){ toast('🔴 No se pudo leer ese Gist — revisa el token y el ID'); renderTab(); return; }
+  }
+  await pushGist();
+  toast(S.settings.gistId ? '🟢 ¡Sincronizado!' : '🟢 Token guardado — el Gist se creará con tu próxima serie');
   renderTab();
-}
-function copyProfile(){
-  try{ navigator.clipboard.writeText(S.profileId); toast('📋 ID copiado'); }
-  catch(e){ toast('Copia manual: selecciona el texto'); }
-}
-function adoptProfile(){
-  const v=(document.getElementById('pidin').value||'').trim();
-  if(v.length<10){ toast('Pega un ID válido'); return; }
-  if(!confirm('¿Usar este ID de perfil? El progreso local se reemplazará con el de la nube si existe.')) return;
-  S.profileId=v; save(); toast('👤 Perfil cambiado'); pullState(); renderTab();
 }
 function download(name,content,mime){
   const a=document.createElement('a');
@@ -1198,7 +1199,7 @@ function toggleSet(k){ S.settings[k]=!S.settings[k]; save(); renderTab(); }
 function stepRest(n){ S.settings.restSecs=Math.min(180,Math.max(15,S.settings.restSecs+n)); save(); renderTab(); }
 function resetWeek(){ if(confirm('¿Reiniciar la semana? (nivel y XP se conservan)')){ S.week=freshWeek(); S.session=null; save(); closeMenu(); render(); } }
 function resetAll(){ if(confirm('¿Borrar TODO el progreso e historial de este dispositivo y empezar de cero?')){
-  S=defaultState(); SL={sessions:[],sets:[],events:[],queue:[]}; saveLog(); save(); closeMenu(); render(); } }
+  S=defaultState(); SL={sessions:[],sets:[],events:[]}; saveLog(); save(); closeMenu(); render(); } }
 
 /* =================================================================
    REST TIMER
@@ -1266,8 +1267,7 @@ try{
   }
 }
 /* sincronización en segundo plano */
-flushSync(); pullState();
-setInterval(flushSync, 30000);
+pullGist();
 </script>
 </body>
 </html>
